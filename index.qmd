@@ -1,0 +1,26 @@
+---
+title: PREFACE
+jupyter: python3
+---
+
+
+## Project overview
+Binary classification problem to detect fraudulent credit card transactions.
+
+## This notebook
+- Data ingestion and quality checks.
+- Feature engineering (date/time extraction, binning).
+- Business validation rules.
+- Train/test split with stratification.
+- Explorative Data Analysis.
+- ML pipeline: cross validation and metrics definition, preprocessing recipe based on EDA insight, workflow set creation (feature engineering, preprocessing post EDA and models).
+- ML workflows' execution and evaluation.
+- Best model choice and test.
+- Model's explainability.
+
+## Key challenge
+- Severely imbalanced dataset (~99.6% legitimate, ~0.4% fraud).
+- Proper handling of double preprocessing: pre and post EDA. Every manipulation must be applied on raw data to ensure deployability.
+- Proper metric choice.
+
+

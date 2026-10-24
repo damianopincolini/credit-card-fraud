@@ -1,0 +1,9 @@
+{
+  "python.analysis.extraPaths": ["${workspaceFolder}", "${workspaceFolder}/scripts"],
+  "[python]": {
+    "editor.codeActionsOnSave": {
+      "source.organizeImports": "explicit",
+      "source.fixAll.ruff": "explicit"
+    }
+  }
+}

@@ -1,0 +1,39 @@
+# ==========================================
+# QUARTO OUTPUTS & RENDER
+# ==========================================
+/outputs/
+/.quarto/
+_book/
+_freeze/
+**/*.quarto_ipynb
+
+# ==========================================
+# PYTHON & JUPYTER
+# ==========================================
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.ipynb_checkpoints/
+
+# ==========================================
+# DATA (Too large / Sensitive)
+# ==========================================
+/data/raw_data/
+/data/processed_data/
+
+# ==========================================
+# ENVIRONMENT & SECRETS
+# ==========================================
+.env
+.venv/
+venv/
+ENV/
+
+# ==========================================
+# OPERATING SYSTEM FILES
+# ==========================================
+Thumbs.db
+ehthumbs.pth
+Desktop.ini
+.DS_Store

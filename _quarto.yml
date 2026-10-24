@@ -1,0 +1,58 @@
+project:
+  type: book
+  output-dir: _book
+
+book:
+  title: "Credit Card Fraud Detection"
+  subtitle: "Binary Classification with Imbalanced Data - Python"
+  author: "Damiano Pincolini"
+  date: last-modified
+  chapters:
+    - index.qmd
+    - 01_intro_data_check.qmd
+    - 02_eda.qmd
+    - 03_modeling.qmd
+
+format:
+  html:
+    theme: zephyr
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    code-fold: true          # Nasconde il codice di default
+    code-summary: "Show Python code"
+    code-tools: true
+    self-contained: true     # Fondamentale: crea un unico file con tutto dentro
+    link-external-newwindow: true
+
+  pdf:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    documentclass: report
+    keep-tex: false
+    classoption: ["oneside", "openany"]
+    geometry: "margin=2cm"
+    pdf-engine: lualatex
+    include-in-header:
+      text: |
+        \usepackage{afterpage}
+        \usepackage{pdflscape}
+        \usepackage{titlesec}
+        \titleformat{\chapter}[display]
+          {\normalfont\large\bfseries}
+          {\chaptertitlename\ \thechapter}{10pt}{\large}
+        \setcounter{secnumdepth}{3}
+        \usepackage{longtable}
+        \usepackage{booktabs}
+        \usepackage{array}
+        \usepackage{pdflscape}
+
+execute:
+  echo: true           # Nell'HTML è meglio mostrare il codice (ripiegato)
+  warning: false
+  error: false
+  jupyter: python3
+
+lang: en
+

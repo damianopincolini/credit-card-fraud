@@ -1,0 +1,987 @@
+---
+title: "EDA"
+jupyter: python3
+---
+
+## Preliminary settings
+
+### Library loading
+
+The following libraries will be used in this part: 
+1) For data manipulation, polars, polars.selectors and pandas.
+2) For data analysis, skimpy (skim), numpy and scipy.stats.
+3) For data visualization, plotnine and great_tables.
+
+
+
+```{python}
+#| label: setup
+#| include: false
+
+# SETUP & CONFIGURATION
+
+# 1. System environment setup
+
+import sys
+from pathlib import Path
+
+# Resolve project root dynamically to allow proper package syntax
+# Namespace collision risk is negligible in a self-contained EDA notebook.
+# If we are in 'notebooks', we need to go up one level to find 'scripts'
+
+current_path = Path.cwd()
+if current_path.name == "notebooks":
+    scripts_path = current_path.parent / "scripts"
+else:
+    scripts_path = current_path / "scripts"
+
+
+# Add the scripts directory to the Python path
+# This allows Python to find your custom .py files inside the /scripts folder
+sys.path.append(str(scripts_path))
+
+# Import your configuration script
+# This executes the os.chdir and pl.Config settings defined in config.py
+import project_config
+import cat_features_subset
+
+
+paths = project_config.paths
+```
+
+```{python}
+#| label: library-loading
+#| include: false
+
+# os, Path have already been loaded in the setup script
+
+# Data manipulation
+import polars as pl
+import polars.selectors as cs
+import pandas as pd # Required for ydata_profiling conversion
+from numba import int16
+
+# Analysis tools
+from skimpy import skim
+import numpy as np
+from scipy.stats import mannwhitneyu
+
+# Data viz
+from plotnine import *
+from great_tables import GT, style, loc
+
+# Note that plotnine is imported using a wildcard (*), which is the standard convention
+# recommended by the library itself. This approach loads all ggplot2-style
+# functions (ggplot, aes, geom_*, theme, labs...) directly into the namespace,
+# mirroring the experience of library(ggplot2) in R.
+
+
+```
+
+### Data loading
+
+The train set shows the following structure (with the first two transposed rows).
+
+```{python}
+#| label: load-data
+#| include: false
+
+data_train = (
+    pl.read_parquet(
+        paths["processed_data_dir"] / "data_train_eda.parquet"
+    )
+)
+
+data_train.head(2).transpose(include_header=True)
+```
+
+
+## Target analysis
+
+As expected, we have a very unbalanced target feature with almost negative cases (legitimate transactions) and a few frauds as shown both in the following table and plot.
+
+```{python}
+#| label: contingency_table
+#| echo: false 
+
+# contingency table
+propTargetValue = (
+    data_train
+    .group_by("is_fraud")
+    .agg(count = pl.len())
+    .with_columns(
+        prop = (
+            pl.col("count") / pl.col("count").sum() * 100)
+            .round(2)
+        )
+)
+
+# fraud ratio
+count_legitimate = (
+    propTargetValue
+    .filter(pl.col("is_fraud") ==  False)
+    .select(pl.col("count"))
+    .item()
+)
+
+count_fraud = (
+    propTargetValue
+    .filter(pl.col("is_fraud") == True)
+    .select(pl.col("count"))
+    .item()
+)
+
+fraud_ratio = int(
+    count_legitimate / count_fraud
+    )
+
+
+# table visualization
+
+(
+    GT(propTargetValue)
+    .tab_header(title="Target feature", subtitle="Absolute values and proportions")
+    .cols_label(is_fraud="fraud", prop="percentage (%)")
+    .tab_source_note(source_note=f"fraud ratio (single fraud to regular transactions): 1 to {fraud_ratio}")
+)
+
+```
+
+
+
+```{python}
+#| label: target_value_plot
+#| echo: false
+
+propTargetValue_pd = propTargetValue.to_pandas()
+
+#| label: target_value_plot
+#| echo: false
+
+propTargetValue_pd = propTargetValue.to_pandas()
+
+p = (
+    ggplot(
+        propTargetValue_pd,
+        aes(
+            x = "factor(is_fraud)",
+            y = "count",
+            fill = "factor(is_fraud)"
+        )
+    )
+    + geom_col(show_legend=False)
+    + geom_text(aes(label='count'), va='bottom', size=10)
+    + scale_fill_manual(values=["#2ecc71", "#e74c3c"])
+    + labs(
+        title="Transactions distribution: legitimate (0) vs fraud (1)",
+        x="transaction kind",
+        y="number of cases"
+    )
+    + coord_flip()
+    + theme_minimal()
+)
+
+p
+
+```
+
+
+## Univariate analysis
+
+### Numerical features
+
+The focus here is on numerical features. A subset will be created with numerical only features in order to calculate some statistics.
+
+```{python}
+#| label: numerical_feature_selection
+#| echo: false
+
+data_train_num = (
+    data_train
+    .select([
+        cs.numeric().exclude("id_transaction"),
+        cs.by_name("is_fraud")
+        ])
+    )
+
+# create sub dataset
+
+data_train_num_legitimate = (
+    data_train_num
+    .filter(pl.col("is_fraud") == 0)
+)
+
+data_train_num_fraud = (
+    data_train_num
+    .filter(pl.col("is_fraud") == 1)
+)
+
+# Note the use of Polars Column Selectors (cs) which provide a powerful and intuitive way to select columns based on their data types or properties rather than just their names.
+
+```
+
+
+```{python}
+#| label: numerical_features_EDA_stats
+#| echo: false
+
+from scripts.eda_numerical_features import FunEdaNum
+# Note the usage of "scripts.eda..." to quote the folder (scripts) and the py file. Import custom EDA functions from the scripts directory.
+
+# Apply FunEdaNum on the complete data_train_num, on the fraud rows only and on the
+# legitimate rows only.
+eda_tot = FunEdaNum(data_train_num, "All transactions")
+eda_leg = FunEdaNum(data_train_num_legitimate, "Legitimate transactions")
+eda_frd = FunEdaNum(data_train_num_fraud, "Fraud transactions")
+
+# 2. Unisci tutto verticalmente
+edaNum_tot = (
+    pl.concat([eda_tot, eda_leg, eda_frd])
+    .sort("feature")
+)
+
+```
+
+
+
+```{python}
+#| label: numerical_features_EDA_table
+#| echo: false
+#| output: false
+
+
+import os
+os.makedirs("outputs", exist_ok=True)
+
+def build_gt(df):
+    return (
+        GT(df, rowname_col="subset", groupname_col="feature")
+        .tab_header(
+            title="Esplorative statistics",
+            subtitle="Comparison amongst kind of transactions"
+        )
+        .cols_label(
+            st_dev="SD", CV="CV%", median="Med", IQR="IQR",
+            skewness="Skew", kurtosis="Kurt",
+            lower_bound="LB", upper_bound="UB",
+            lower_outlier="O.Low", upper_outlier="O.High",
+            total_outlier="O.Tot"
+        )
+        .cols_width({
+            "subset": "50pt",
+            "st_dev": "32pt", "CV": "32pt", "median": "32pt",
+            "IQR": "32pt", "skewness": "32pt", "kurtosis": "32pt",
+            "lower_bound": "32pt", "upper_bound": "32pt",
+            "lower_outlier": "32pt", "upper_outlier": "32pt",
+            "total_outlier": "32pt"
+        })
+        .tab_options(
+            table_font_size="7pt",
+            data_row_padding="1px",
+            column_labels_font_size="7pt",
+            table_width="auto"
+        )
+        .fmt_number(
+            columns=cs.numeric().exclude("count", "total_outlier",
+                                          "lower_outlier", "upper_outlier"),
+            decimals=1
+        )
+        .fmt_percent(columns=["CV"], decimals=1)
+    )
+
+features = edaNum_tot["feature"].unique().to_list()
+mid = len(features) // 2
+
+half1 = edaNum_tot.filter(pl.col("feature").is_in(features[:mid]))
+half2 = edaNum_tot.filter(pl.col("feature").is_in(features[mid:]))
+
+build_gt(half1).save("outputs/eda_num_table_1.png", scale=2)
+build_gt(half2).save("outputs/eda_num_table_2.png", scale=2)
+
+
+```
+
+![Statistiche esplorative - Parte 1](outputs/eda_num_table_1.png)
+
+![Statistiche esplorative - Parte 2](outputs/eda_num_table_2.png)
+
+Generally speaking, due to the strong unbalanced presence of legitimate transactions, statistics referred to these latter cases are prone to determine the overall statistics.
+Age doesn't show any particular difference between fraud and legimitate transactions.
+Amount actually has very clear differences in statistics: frauds have much higher mean and median, a much more normal distribution (almost no skewness), a shorter range and a low and upper bounds that are much further from each other causing a lack of outliers (which, instead, are present for legitimate cases).
+Hour shows different values as far as mean, q1 and q3 are concerned. Due to the nature of this value (with a naturally fixed range), there's no room for outliers. This predictor deserve a closer look.
+City population shows an interesting fact: looking at this feature's range, frauds happens in cities with a population that varies from 23 to 1.500.000 people, while legitimate transaction from 23 to 2.900.000 (note that the city with the largest population to appear in the dataset is Houston, which means that transactions happened in LA, New York and Chicago, which are bigger that Houston, have not been saved in the dataset). It seems that there are few big cities (Houston, as said, Philadelphia and San Antonio that are supposed to count more than 1.500.000 habitans) where frauds do not happen. Approaching the observation with some kind of domain knolwdge, this point assesses a lack of coverage in the dataset, not a proper fraud behaviour pattern.
+day and weekday do not provide with any relevant insight about differences between frauds and legitimate transactions.
+month is a predictor which is not supposed to be used since dataset does not cover a whole year span-time.
+
+
+
+
+```{python}
+#| label: city_pop_distribution_plot
+#| echo: false
+
+p = (
+    ggplot(data_train_num)
+    + geom_density(
+        mapping = aes(
+            x = "city_pop",
+            fill = "is_fraud",
+            colour = "is_fraud"
+            )
+    )
+    + facet_wrap("is_fraud")
+    + theme_minimal()
+)
+
+p
+
+```
+
+Distributions look similar, with some case (hardly detectable at first sight) of legitimate transaction happened in biggest cities where no fraud has been detected.
+
+```{python}
+#| label: trans_amount_distribution_plot_fraud+legitimate
+#| echo: false
+
+p = (
+    ggplot(data_train_num)
+    +geom_density(
+        mapping = aes(
+            x = "amount",
+            fill = "is_fraud",
+            colour = "is_fraud"
+        ),
+        alpha = 0.5
+    )
+    + theme_minimal()
+)
+
+p
+
+```
+
+The plot clearly shows the different distribution of legitimate and fraudulent transactions. This is supposed to be a relevant predictor. 
+
+
+```{python}
+#| label: transaction_hour_distribution_plot
+#| echo: false
+
+p = (
+    ggplot(data = data_train_num)
+    + geom_density(
+        mapping = aes(
+            x = "hour",
+            fill = "is_fraud",
+            colour = "is_fraud"
+        ),
+        alpha = 0.5
+    )
+    + labs(
+        title="Hour-based transactions distribution"
+    )
+)
+
+p
+
+```
+
+This plot testifies more clearly than the table there's quite a huge difference between frauds and regular transactions: frauds are committed at the beginning and in the end of the day. Time from midnight to 4 am and from 5/6 p.m to midnight seems preferred by criminals. 
+
+```{python}
+#| label: transaction_day_distribution_plot
+#| echo: false
+
+p = (
+    ggplot(data = data_train_num)
+    + geom_density(
+        mapping = aes(
+            x = "day",
+            fill = "is_fraud",
+            colour = "is_fraud"
+        ),
+        alpha = 0.5
+    )
+    + labs(
+        title = "Month day-based transactions distribution"
+    )
+)
+
+p
+
+```
+
+Frauds happen easily around the first (around the 5th) and the last (around 25th) days of each month. Frauds show a clear bimodal distribution which is not detectable for legitimate transactions.
+
+
+```{python}
+#| label: transaction_weekday_distribution_plot
+#| echo: false
+
+p = (
+    data_train_num
+    .group_by(["is_fraud", "weekday"])
+    .len()
+    .with_columns(
+        perc = (pl.col("len") / pl.col("len").sum().over("is_fraud"))*100
+    )
+    .pipe(ggplot)
+    + geom_col(
+        mapping = aes(
+            x = "weekday",
+            y = "perc",
+            fill = "is_fraud"
+        ),
+        position = "dodge"
+    )
+    + facet_wrap("~is_fraud") 
+    + labs(
+        x = "weekday",
+        y = "percentage",
+        title = "weekday-based transaction percentage per target class"
+        )
+)
+
+p
+
+# Note that over() command (Window Function) performs an aggregation over a specific group # (or "window") of rows without collapsing the dataframe. It allows you to compute 
+# group-level statistics (like sums or means) while maintaining the original row-level
+# granularity, which is essential for calculating relative proportions or normalized 
+# values.
+
+```
+
+Legitimate transactions happens more often on Mondays and Tuesdays.
+Sundays show a very similar percentage of legitimate and fraudulent transaction. From Wednesdays to Fridays frauds show higher proportions than regular payments.
+
+```{python}
+#| label: age density
+#| echo: false
+
+p = (
+    ggplot(data = data_train_num)
+        + geom_density(
+            mapping = aes(
+                x = "age",
+                fill = "is_fraud",
+                colour = "is_fraud"
+            ),
+            alpha = 0.5
+        )
+        + labs (
+            title = "Transactions per age"
+            )
+        + theme_minimal()
+)
+
+p
+
+```
+
+A kind of difference appears, but it's quite hard to assess if it's relevant or not just from the plot. It seems useful analyse some association index (further on in bivariate analysis section).
+
+### Outlier detection
+
+We've already spotted some feature that express outliers (1st/3rd quartile -/+ 1.5 times IQR): age (84), amount (22.000+), city population (84.000+).
+Actually, age feature has been trasformed into category (bins) so as to have a clearer and less noisy visual. 
+It should be noted that age and amount's ouliers are only present for legitimate transaction while no outlier appears in the fraud subset.
+As far as city_pop is concerned, out of the whole dataset total cases outliers represent the 18.7%; in the legitimate subset the percentage of outlier is 18.7% and in the fraud subset the percentage is 18.5%. It seems there's a very regular and similar pattern here.  
+
+```{python}
+#| label: outlier_detction_plot_age
+#| echo: false
+
+p = (
+    ggplot(data = data_train_num)
+    + geom_boxplot(
+        mapping = aes(
+            x = "is_fraud",
+            y = "age",
+            colour = "is_fraud"
+        )
+    )
+    + coord_flip()
+    + labs(title = "Outlier detection - cardholder age")
+)
+
+p
+
+```
+
+No big difference appears.
+
+```{python}
+#| label: outlier_detection_plot_amount
+#| echo: false
+
+p = (
+    ggplot(data = data_train_num)
+    +geom_boxplot(
+        mapping = aes(
+            x = "is_fraud",
+            y = "amount",
+            colour = "is_fraud"
+        )
+    )
+    + coord_flip()
+    + labs (title = "Outlier detection - Transaction amount")
+    + theme_minimal()
+)
+
+p
+
+```
+
+Boxplot confirms that frauds have a more normal distribution, showing no outliers with an higher median. Legitimate transactions express a lot of outliers, which seems to be more "normal" (almost a joke) from a business prespective: high-value legitimate transactions are not outliers in a pathological sense; the IQR-based method flags them as statistical outliers, but they are not anomalous from a business point of view. All in all, we just recognize a strong and clear difference.
+
+### Categorical features
+
+```{python}
+#| label: dataTrainCat_creation
+#| echo: false
+
+%run "scripts/cat_features_subset.py"
+
+```
+
+
+```{python}
+#| label: merchant category_plot
+#| echo: false
+
+p = (
+    ggplot(data = data_train_cat)
+    + geom_bar(
+        mapping = aes(
+            x = "category",
+            y = after_stat("prop"),
+            group = 1,
+            fill = "is_fraud"
+        )
+    )
+    + facet_wrap(
+        "is_fraud",
+        ncol = 1
+        )
+    + labs(
+        title = "Transaction per merchant category",
+        x = "merchant category",
+        y = "percentage",
+        fill = "fraud flag"
+    )
+    + theme(
+        # x axis dimension and rotation
+        axis_text_x = element_text(
+            size = 8,
+            rotation = 45,
+            hjust = 1
+            ),
+        
+        # y axis dimension
+        axis_text_y = element_text(size = 8),
+        
+        # titles dimension (x and y axis)
+        axis_title_x = element_text(
+            size =10,
+            fontweight = "normal"
+            ),
+        axis_title_y = element_text(
+            size= 10,
+            fontweight = "normal"
+            ),
+        
+        # Dimensione del titolo del grafico
+        plot_title=element_text(
+            size = 12,
+            fontweight = "normal"
+            ),
+
+        # legend title
+        legend_title = element_text(
+            size=8,
+            fontweight = "normal"
+            ),
+        
+        # legend text
+        legend_text = element_text(
+            size = 8,
+            fontweight = "normal",
+            fontstyle="italic"
+        )
+    )
+)
+
+p
+
+```
+
+Clearly, grocery_pos, misc_net and shopping_net reach some peaks as far as frauds are concerned. Other merchant categories have lower fraud proportion that legitimate ones. This feature seems to be a good predictor.
+
+
+```{python}
+#| label: gender_plot
+#| echo: false
+
+p = (
+    ggplot(data = data_train_cat)
+    + geom_bar(
+        mapping = aes(
+            x = "gender",
+            y = after_stat("prop"),
+            group = 1,
+            fill = "is_fraud"
+        )
+    )
+    + facet_wrap(
+        facets = "is_fraud",
+        ncol = 1
+    )
+    + labs(
+        title = "transaction per gender",
+        x = "gender",
+        y = "percentage",
+        fill = "fraud flag"
+    )
+    + theme(
+        axis_text_x = element_text(
+            size = 8,
+            rotation = 45,
+            hjust = 1
+        ),
+        axis_text_y = element_text(size = 8),
+        axis_title_x = element_text(
+            size =10,
+            fontweight = "normal"
+        ),
+        axis_title_y = element_text(
+            size = 10,
+            fontweight = "normal"
+        ),
+        plot_title = element_text(
+            size = 12,
+            fontweight = "normal"
+            ),
+        legend_title = element_text(
+            size=8,
+            fontweight = "normal"
+            ),
+        legend_text = element_text(
+            size = 8,
+            fontweight = "normal",
+            fontstyle="italic"
+        )
+    )
+)
+
+p
+
+```
+
+No significant difference is seen. Gender's cardholder does not seem able to discriminate if a transaction has more or less possibility to be a fraud.
+
+```{python}
+#| label: age_bin_category_plot
+#| echo: false
+
+p = (
+    ggplot(data = data_train_cat)
+    + geom_bar(
+        mapping = aes(
+            x = "age_bins",
+            y = after_stat("prop"),
+            group = 1,
+            fill = "is_fraud"
+        )
+    )
+    + facet_wrap(
+        facets = "is_fraud",
+        ncol = 1
+    )
+    + labs(
+        title = "transaction per age bin",
+        x = "age bins",
+        y = "percentage",
+        fill = "fraud false"
+    )
+    + theme(
+        axis_text_x = element_text(
+            size = 8,
+            rotation = 45,
+            hjust = 1
+        ),
+        axis_text_y = element_text(size = 8),
+        axis_title_x = element_text(
+            size =10,
+            fontweight = "normal"
+        ),
+        axis_title_y = element_text(
+            size = 10,
+            fontweight = "normal"
+        ),
+        plot_title = element_text(
+            size = 12,
+            fontweight = "normal"
+            ),
+        legend_title = element_text(
+            size=8,
+            fontweight = "normal"
+            ),
+        legend_text = element_text(
+            size = 8,
+            fontweight = "normal",
+            fontstyle="italic"
+        )
+    )
+)
+
+p
+
+```
+
+The proportion of fraudulent/legitimate transaction does not vary significantly according to age bins: it seems that 36-50 years old card holders face a lower proportion of frauds than normal transactions, while 51-65 bin is more prone to suffer from frauds, but it seems a nuance more than a pattern.
+
+
+```{python}
+#| label: amount_bins_plot
+#| echo: false
+
+p = (
+    ggplot(data = data_train_cat)
+    + geom_bar(
+        mapping = aes(
+            x = "amount_bins",
+            y = after_stat("prop"),
+            group = 1,
+            fill = "is_fraud"
+        )
+    )
+    + facet_wrap(
+        facets = "is_fraud",
+        ncol = 1
+    )
+    + labs(
+        title = "transaction per amount bins",
+        x = "amount bins",
+        y = "percentage",
+        fill = "fraud flag"
+    )
+    + theme(
+        axis_text_x = element_text(
+            size = 8,
+            rotation = 45,
+            hjust = 1
+        ),
+        axis_text_y = element_text(size = 8),
+        axis_title_x = element_text(
+            size =10,
+            fontweight = "normal"
+        ),
+        axis_title_y = element_text(
+            size = 10,
+            fontweight = "normal"
+        ),
+        plot_title = element_text(
+            size = 12,
+            fontweight = "normal"
+            ),
+        legend_title = element_text(
+            size=8,
+            fontweight = "normal"
+            ),
+        legend_text = element_text(
+            size = 8,
+            fontweight = "normal",
+            fontstyle="italic"
+        )
+    )
+)
+
+p
+
+```
+
+There is a clear difference in the proportions of frauds/non frauds associated with transactions' amount bins. Specifically, what we've called extra large tickets (more than 500 dollars) are easily associated with frauds, while smaller purchases are more often legitimate.
+
+```{python}
+#| label: job_aggregate_plot
+#| include: false
+
+p = (
+    ggplot(data = data_train_cat)
+    + geom_bar(
+        mapping = aes(
+            x = "job_aggregate",
+            y = after_stat("prop"),
+            group = 1,
+            fill = "is_fraud"
+        )
+    )
+    + facet_wrap(
+        facets = "is_fraud",
+        ncol = 1
+    )
+    + coord_flip()
+    + labs(
+        title = "transaction per job",
+        x = "job",
+        y = "percentage",
+        fill = "fraud flag"
+        )
+    + theme(
+        axis_text_x = element_text(
+            size = 6
+            ),
+        axis_text_y = element_text(
+            size = 6
+            ),
+        axis_title_x = element_text(
+            size =10,
+            fontweight = "normal"
+            ),
+        axis_title_y = element_text(
+            size = 10,
+            fontweight = "normal"
+            ),
+        plot_title = element_text(
+            size = 12,
+            fontweight = "normal"
+            ),
+        legend_title = element_text(
+            size=8,
+            fontweight = "normal"
+            ),
+        legend_text = element_text(
+            size = 8,
+            fontweight = "normal",
+            fontstyle="italic"
+        )
+    )
+)
+
+p
+
+```
+
+
+## Bivariate analysis
+
+### Numerical features vs. target
+
+```{python}
+#| label: wilcoxon_test_for_numerical_features
+#| echo: false
+
+from scripts.eda_test_Wilcoxon_num_feature import FunWilcoxonTest
+
+numerical_predictors = data_train_num.select(cs.numeric() - pl.col("is_fraud")).columns
+
+edaNum_Wilcoxon = FunWilcoxonTest(
+    df = data_train_num,
+    target = "is_fraud",
+    numericalFeatures = numerical_predictors
+)
+
+
+# table visualization
+
+(
+    GT(edaNum_Wilcoxon)
+    .tab_header(title="Wilcoxon test", subtitle="Association between numerical predictors and target variable")
+)
+
+```
+
+We can read this values following a sort of two-stage statistical filter:
+1. Statistical Significance (the gatekeeper): the p-value acts as the initial threshold. It evaluates whether the observed difference in distributions between target groups (frauds vs. legitimate) is statistically robust or merely a product of random sampling noise. If p >= 0.05, the feature is immediately discarded, rendering its effect size meaningless.
+2. Practical Significance (the magnitude): for features passing the p-value test, the Rank-Biserial Correlation (effect size) is evaluated. In large datasets, the p-value becomes highly sensitive and will almost always report significance (p < 0.05), even for trivial differences. 
+Therefore, the normalized effect size (-1 to +1 scale) is the critical metric used to quantify the actual predictive power and practical strength of each feature, allowing for effective ranking and pruning before model training.
+
+Again, we can see how amount appears as the most relevant feature, while the rest are pretty arount 0 (note than month is not so reliable since the dataset does not cover a whole 12-month span) which would lead us to underestimate their importance.
+
+
+### Categorical features vs. target
+
+```{python}
+#| label: Cramer's V
+#| echo: false
+
+from eda_cramer_V_cat_feature import FunCramerV
+
+EdaCat_CramersV = FunCramerV(
+    df = data_train_cat,
+    target = "is_fraud",
+    cat_features = [
+        "merchant", "category", "gender", "job_aggregate",
+        "age_bins", "amount_bins"
+        ]
+    )
+
+#EdaCat_CramersV
+
+# table visualization
+
+(
+    GT(EdaCat_CramersV)
+    .tab_header(title="Cramer's V", subtitle="Association between categorical predictors and target variable")
+)
+
+```
+
+Amount bins provides a confirmation of amount relevance from a different angle, as well as gender and age show very limited fraud prediction attitude. 
+
+## Multivariate analysis
+
+### Correlation between numerical predictors 
+
+```{python}
+#| label: multivariate analysis_correlation_between_num_predictors
+#| echo: false
+
+from eda_num_multivariate_correlation import FunPearsonCorr
+
+FunPearsonCorr(data_train_num)
+
+
+```
+
+It's quite interesting to note that no significant correlation between predictors have been detected. This does not appear a reason for feature selection.
+
+### Association between categorical predictors (Cramér’s V)
+
+```{python}
+#| label: multivariate analysis_correlation_between_cat_predictors
+#| echo: false
+
+from eda_cat_multivariate_association import FunCramerV_multivariate
+
+FunCramerV_multivariate(data_train_cat)
+
+```
+
+Here we notice a couple of associated predictors: job_aggregate and gender. They seem pretty linked (Cramer's V equal to 0.747) and that could lead us to select one of the two avoiding any kind of redundancy in our ML model. job_aggregate seems to be the strongest candidate since its association with target feature is bigger (less small, actually) in terms, again, of Cramer's V (0.15 vs 0.0004).
+
+## Conclusions & EDA-driven preprocessing 
+
+
+### Insights
+1) Unbalanced target values. It's fair and predictable since the nature and the content of the dataset. It's necessary to take this into account when it'll come to choose models and performance metrics.
+2) Transaction amount stands out as the most relevant feature to be considered. If considered as a number or a category (via binning), the different behaviour of target value is clear.
+3) Date-related information also seem relevant: transactions' hour, month day and week day do beahave in kind of different ways according they're a fraud or not.
+4) merchant category is definitely worth to keep since three specific categories are clearly "fraud oriented" (grocery_pos, misc_net and shopping_net).
+5) gender appears a useless predictor.
+6) age_bin shows some kind of relevance when plotted, but once measured with Cramer's V (0.01) it appears as a week predictor. 
+7) job_aggregate would deserves to be kept (Cramer's V equal to 0.15: it's quite low but still the second highest value)
+8) association between predictors has been spotted only for the job_aggregate-gender couple, where the first is more relevant than the latter when evaluated alone in relationship with the target value. 
+
+### Take-aways
+Preprocessing should be executed with these goals:
+1) Feature to eliminate: month (not every month of the year is covered), gender, age and age_bins.
+2) Feature to keep: every other features including what has been newly calculated.
+
+### Final notes
+Given the EDA findings, the following must be addressed during modeling:
+1) Imbalance handling strategy must be explicitly chosen and justified: SMOTE, class weighting, or threshold tuning. Given the 1:258 ratio, this is not optional.
+2) Preprocessing pipeline must encode high-cardinality features (merchant, job) carefully — one-hot encoding will be impractical.
+3) Metric selection is critical: accuracy is meaningless here. The primary metrics should be Precision-Recall AUC, F1 (fraud class), and potentially cost-sensitive metrics: a false negative cost is bigger that a false positive cost in a fraud detection scenario.
+4) Baseline model should be established before tuning: a dummy classifier predicting always "legitimate" would achieve 99.61% accuracy, which is the benchmark to beat in a meaningful way.
+5) The EDA-driven feature selection decisions (drop gender, month, age/age_bins) must be formalised in the preprocessing recipe.

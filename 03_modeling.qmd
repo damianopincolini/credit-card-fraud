@@ -1,0 +1,646 @@
+---
+title: "MODELING"
+jupyter: python3
+---
+
+The aim of this chapter is to "put it all together" and define which combination of recipe and model suits better the fraud prediction task.
+Four major steps are taken:
+
+1. Settings: as usual it's necessary to recall datasets, libraires, scripts and paths. Performance mesures and cross-validation must be defined, as well as a seed must be set for reproducibility.
+2. Workflow set creation: pre-processing recipes (both pre and post era) and models are combined into different workflows.
+3. Workflow set execution and evalutation: each workflow is executed, their performances are gathered and compared; the best performer is used for the final fit getting definite results.
+4.  Explainability: SHAP tecnique is used to show the most relevant features the model relies on when making predictions.
+
+
+## Preliminary settings
+
+Preliminary settings are related to:
+
+1. Recalling files from data import and loading needed libraries.
+
+2. Setting a seed for future code's reproducibility.
+
+3. Splitting target feature ($y$, representing is_fraud) and predictors ($X$). This strict isolation prevents data leakage during preprocessing and training.
+
+4. Definition of validation strategy (StratifiedKFold and PR-AUC). A 5-fold stratified cross-validation scheme preserves the target class distribution across all folds.
+
+5. Setting of the primary metric. PR-AUC (Precision-Recall Area Under the Curve) is selected as the primary metric to evaluate performance effectively on highly imbalanced fraud data rather than relying on overall accuracy.
+
+### Library and data loading
+
+During modeling, scikit learn will be the most relevant library to use, altough lightgbm and xgboost libraries will be imported as well.
+
+```{python}
+#| label: setup
+#| include: false
+
+import sys
+from pathlib import Path
+
+# 1. 'scripts' folder defition
+# We need to be sure that scripts can be reliably found in their folder: a good practice is to locate the exact file system "position" where the scripts are (which is "scripts" folder) and make sure that will always be the place to go.
+# The next piece of code is aimed to:
+# Dynamically locates the 'scripts' folder to ensure robust path resolution.
+# Adds this path to Python's system path (`sys.path`) with top priority.
+# Enables seamless importing of custom project modules (e.g., `project_config`).
+current_path = Path.cwd()
+
+if (current_path / "scripts").exists():
+    scripts_path = current_path / "scripts"
+elif (current_path.parent / "scripts").exists():
+    scripts_path = current_path.parent / "scripts"
+else:
+    raise FileNotFoundError(f"Impossibile trovare la cartella 'scripts' a partire da: {current_path}")
+
+# 'scripts' in the head of research path
+# By dynamically locating the project's "scripts" directory, this code give priority 1 to its path to Python's internal search list (sys.path). This ensures that custom project modules are reliably found and loaded first, preventing any import errors regardless of where the execution is triggered.
+sys.path.insert(0, str(scripts_path))
+
+
+# 2. CACHE REMOVAL: erase 'config' if already imported
+
+if "config" in sys.modules:
+    del sys.modules["config"]
+
+
+# 3. Import of project configuration 
+# Clears Python's internal cache for configuration modules to force a 
+# fresh reload from disk, preventing stale data and ghost bugs during 
+# iterative development.
+import project_config
+paths = project_config.paths
+
+
+# 4. Libraries loading:
+
+# 4.1. Data Manipulation & Arrays
+import polars as pl
+import numpy as np
+import pandas as pd
+
+# 4.2. Machine Learning Algorithms
+import lightgbm as lgb
+import xgboost as xgb
+from sklearn.ensemble import RandomForestClassifier
+
+# 4.3. Preprocessing & Pipeline Components
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import (
+    RobustScaler, 
+    OneHotEncoder, 
+    OrdinalEncoder, 
+    FunctionTransformer
+)
+
+# 4.4. Cross-Validation & Resampling
+from sklearn.model_selection import StratifiedKFold, cross_validate
+
+# 4.5. Metrics & Model Interpretation
+import shap
+from sklearn.metrics import (
+    confusion_matrix, 
+    precision_score, 
+    recall_score, 
+    f1_score, 
+    roc_auc_score
+)
+
+# 4.6. Local Project Scripts & Modules
+# Feature Engineering pre-EDA
+from data_wrangling_v2 import feature_engineering
+
+# 4.7 Data viz
+from great_tables import GT, style, loc
+
+# 5. seed setting
+
+RANDOM_STATE = 42
+
+```
+
+As far as datasets are concerned, it's important to recall that at the end of Chapter 1 (data loading), two kinds of datasets were saved: one for Chapter 2 (EDA) and one for Chapter 3 (Modeling). 
+EDA uses a dataset which hase been manipulated to leverage the "domain knowledge" and get some more insights.
+Modeling must be fed with raw data that come straight from production to ensure the ML solution is scalable once approved.
+In the end, two different manipulation are executed in two different times: before and after EDA. The overall preprocessing chain looks like: raw data -> preprocessing 1 (for EDA) -> insight from EDA - > preprocessing 2 (for modeling). 
+This means that the transformations planned during EDA must be fully integrated into the modeling pipeline, which properly starts from raw data.  
+
+```{python}
+#| label: modeling_data_import
+#| include: false
+
+# data import and target vs predictors definition
+
+
+# 1. loading of parquet files saved at the end of chapter 1 
+# based on raw/original data and thus functional to Modeling End-to-End since they provide with the outcome of informative system.
+data_train = pl.read_parquet(paths["processed_data_dir"] / "data_train_modeling.parquet")
+data_test = pl.read_parquet(paths["processed_data_dir"] / "data_test_modeling.parquet")
+
+
+# 2. target (y) vs predictors (X) separation
+
+TARGET = "is_fraud"
+
+# X_train and X_test mantain all orginal columns (included ID, gender, month, etc.)
+# y_train and y_test are converted into NumPy arrays, serving as 
+# optimized vectors ready for mathematical computation and model training.
+X_train = data_train.drop(TARGET)
+y_train = data_train[TARGET].to_numpy()
+
+X_test = data_test.drop(TARGET)
+y_test = data_test[TARGET].to_numpy()
+
+# 3. dynamic computation of fraud_ratio (needed for XGBoost model)
+# Note that the outcome of fraud_ratio is the same that has already been calculated during EDA. The duplication of the computation based on y_train is a redundancy justified but the will of keeping chapter 3 autonomous, quick and self-sufficient.
+count_legitimate = (y_train == False).sum()
+count_fraud = (y_train == True).sum()
+fraud_ratio = count_legitimate / count_fraud
+
+```
+
+
+### Cross validation and metrics
+
+Cross-validation scheme is based upon 5 splits (a higher number of folders would have require to much computation capacitlities), while the chosen metrics are: "pr_auc" (the primary one), roc_auc, f1, precision, recall.
+
+```{python}
+#| label: modeling_cv_setup_and_metrics
+#| include: false
+
+
+# 1. Cross-Validation scheme (Stratified K-Fold)
+
+cv_scheme = StratifiedKFold(
+    n_splits = 5, 
+    shuffle = True, 
+    random_state = RANDOM_STATE
+)
+
+
+# 2. evaluation metrics for cross-validation
+
+scoring_metrics = {
+    "pr_auc": "average_precision",  # Metrica guida
+    "roc_auc": "roc_auc",
+    "f1": "f1",
+    "precision": "precision",
+    "recall": "recall"
+}
+
+PRIMARY_METRIC = "pr_auc"
+
+```
+
+
+## Workflow sets creation
+
+### Preprocessing recipes
+
+What is needed at this stage is to consolidate the steps that transform raw data into data to feed the model.
+So, it's mandatory both to recall the feature engineering function (used to manipulate raw data and then explore them during EDA) and to set up a second preprocessing pipeline (using a ColumnTransformer) that turns categorical features into numbers since Scikit-Learn models require purely numerical data to perform mathematical computations.
+
+```{python}
+#| label: preprocessing_recipe
+#| include: false
+
+# The aim here is to define the `ColumnTransformer, which executes specific transformation on the features selected during EDA and drops down all useless columns (`gender`, `month`, `age`, `age_bins`, `id_transaction`) using remainder='drop' argument.
+
+
+# 1. Useful features
+# Note that separating categorical variables into cat_low_card and cat_high_card is a fundamental Machine Learning practice to choose the correct encoding technique for each type of feature.
+
+NUMERIC_FEATURES = ["amount", "city_pop", "hour", "day", "weekday"]
+CAT_LOW_CARD = ["category", "job_aggregate"]
+CAT_HIGH_CARD = ["merchant"]
+
+
+# 2. Recipe definition (ColumnTransformer)
+# Sets up a preprocessing pipeline using a ColumnTransformer. This is necessary because Scikit-Learn models require purely numerical data to perform mathematical computations. Consequently, encoding and scaling preprocessing steps are mandatory.
+# Rule 1 ("num"): applies a RobustScaler to numeric features to safely handle outliers.
+# Rule 2 ("cat_low"): applies a OneHotEncoder to low-cardinality categorical features, dropping the first category to avoid multicollinearity while ignoring unknown labels.
+# Rule 3 ("cat_high"): applies an OrdinalEncoder to high-cardinality categorical features, converting text into integers and assigning -1 to unseen categories.
+preprocessor = ColumnTransformer(
+    transformers = [
+        ("num", RobustScaler(), NUMERIC_FEATURES),
+        ("cat_low", OneHotEncoder(drop="first", handle_unknown="ignore", sparse_output=False), CAT_LOW_CARD),
+        ("cat_high", OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1), CAT_HIGH_CARD)
+    ],
+    remainder = "drop" # automatically drops down every columns which is not explicity called # above
+)
+
+# 3. Feature Engineering Pre-EDA (to be included into Pipeline End-to-End)
+fe_step = FunctionTransformer(feature_engineering)
+
+```
+
+
+### Models' specifications
+
+It's now time to create a models' dictionary containing the algorithms that we want to use and amongst which to choose the most performing.
+
+```{python}
+#| label: workflow_models
+#| include: false
+
+
+# 1. Models' dictionary 
+
+models = {
+    "LightGBM": lgb.LGBMClassifier(
+        random_state=RANDOM_STATE, 
+        class_weight="balanced",
+        n_jobs=1
+    ),
+    "RandomForest": RandomForestClassifier(
+        random_state=RANDOM_STATE, 
+        class_weight="balanced",
+        n_jobs=1
+    ),
+    "XGBoost": xgb.XGBClassifier(
+        random_state=RANDOM_STATE,
+        scale_pos_weight=fraud_ratio,  # Gestione sbilanciamento in XGBoost
+        n_jobs=1,
+        eval_metric="logloss"
+    )
+}
+
+```
+
+At this stage, we have:
+1. usable datasets (`X_train`, `y_train`).
+2. cross-validation system (`StratifiedKFold`).
+3. Automatic pre-EDA recipe ('fe_step') that contains domain knowledge based manipulation executed before EDA.
+4. Automatic preprocessing recipe (`preprocessor`) based on the insight resulting from EDA.
+5. A group of models that can be combined with preprocessing step in order to predict target (unknown) variable.
+
+
+## Workflow combination and execution
+
+With all these components, it's possibile to configure the workflow sets combining recipes and models in specific pipelines that are ready to be evaluated via Cross-Validation.
+
+### Workflow sets' assembly and cross validation
+
+```{python}
+#| label: workflow_assembly
+#| include: false
+
+# 2. workflow_set creation: Scikit-Learn pipeline dictionary
+# Note that complete pipeline End-to-End: raw data are manipulated with both pre-EDA recipe (feature engineering) and post-EDA recipe (preprocessing in strictu sensu). 
+
+workflow_set = {}
+
+for name, model in models.items():
+    workflow_set[name] = Pipeline(steps=[
+        ("feature_engineering", fe_step),
+        ("preprocessing", preprocessor),
+        ("classifier", model)
+    ])
+
+```
+
+
+
+```{python}
+#| label: cross-validation
+#| include: false
+
+
+# 1. cv_results dictionary initialization
+cv_results = {}
+
+# 2. training cycles on raw data using every workflow previously created in workflow_set dictionary
+
+for name, pipeline in workflow_set.items():
+    cv_results[name] = cross_validate(
+        estimator = pipeline,
+        X = X_train,
+        y = y_train,
+        cv = cv_scheme,
+        scoring = scoring_metrics,
+        n_jobs = 1,                 # Parallelization on all CPUs
+        return_train_score = False,  # Tells scikit-Learn to compute metrics only  on validation fold (test_) and not on training folds (train_). 
+        error_score = "raise" # default value. In case of error during training, it stops immediately the execution and shows the error (traceback).
+    )
+
+
+```
+
+
+### Metrics computation and best model choice
+
+Workflows' performances can be exposed and evaluated in order to extract the best model using pr_auc metric.
+
+```{python}
+#| label: cv_results
+#| include: false
+
+# List Initialization: Creates an empty list (`metrics_summary`) to temporarily store the extracted dictionaries for each model and metric.
+metrics_summary = []
+
+# 1. Outer Loop: Iterates through the top-level dictionary (`cv_results`), extracting each model's name (e.g., "LightGBM", "RandomForest", "XGBoost") and its corresponding inner dictionary of scores.
+# 2. Inner Loop: Iterates through the keys and NumPy arrays of the model's inner dictionary (which contain fold scores, fit times, score times, etc.).
+# 3. Filtering: Keeps only evaluation metrics by filtering keys starting with "test_" (this automatically drops execution times like `fit_time`).
+# 4. Name Cleaning: Strips the "test_" prefix (e.g., "test_pr_auc" becomes "pr_auc") for better readability in final reports.
+# 5. Statistical Calculation: Computes the mean and standard deviation of the scores across the 5 cross-validation folds, rounding the results to 4 decimal places.
+# 6. Tabular Conversion: Appends the structured metrics to the list and converts the final collection into a structured Polars DataFrame (`cv_summary`).
+for model_name, model_cv in cv_results.items():
+    for key, scores in model_cv.items():
+        if key.startswith("test_"):
+            metric_name = key.replace("test_", "")
+            mean_val = float(scores.mean())
+            std_val = float(scores.std())
+            
+            metrics_summary.append({
+                "modello": model_name,
+                "metrica": metric_name,
+                "media": round(mean_val, 4),
+                "dev_std": round(std_val, 4)
+            })
+
+# Cconvertion of the final collection into a structured Polars DataFrame (`cv_summary`).
+cv_summary = pl.DataFrame(metrics_summary)
+
+```
+
+
+```{python}
+#| label: cv_results_table_exibithion
+#| echo: false
+
+(
+    GT(cv_summary)
+    .tab_header(title="Cross-validation results")
+    #.cols_label(is_fraud="fraud", prop="percentage (%)")
+)
+
+```
+
+
+```{python}
+#| label: best_model_selection
+#| include: false
+
+# Find the most performing workflow
+best_workflow_name = (
+    cv_summary
+    .filter(pl.col("metrica") == "pr_auc")
+    .sort("media", descending = True)
+    .item(0,0) # with item method I just pick the content of the choosen cell
+)
+
+# Isolate the workflow
+best_workflow = workflow_set[best_workflow_name]
+
+```
+
+XGBoost wins as a tie-break: 0.830 vs 0.821 vs 0.821, with a standard deviation of about 0.01–0.017.
+
+Once the best recipe-model combination has been found, it's necessary to fit it and then test it using, for the very first time, the test dataset and getting data test-based performances.
+
+
+## Out-Of-Fold (OOF) threshold optimization 
+
+
+### OOF prediction generation
+
+```{python}
+#| label: OutOfFold_threshold_optimization
+#| include: false
+
+from sklearn.model_selection import cross_val_predict
+from sklearn.metrics import precision_score, recall_score, f1_score
+
+# OOF (Out-Of-Fold) probabilities on training set
+y_train_oof_prob = cross_val_predict(
+    best_workflow, 
+    X_train, 
+    y_train, 
+    cv=cv_scheme, 
+    method="predict_proba", 
+    n_jobs=-1
+)[:, 1]
+
+# Threshold optimization based on OOF only
+thresholds = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+results = []
+
+for t in thresholds:
+    preds = (y_train_oof_prob >= t).astype(int)
+    
+    precision = precision_score(y_train, preds, zero_division=0)
+    recall = recall_score(y_train, preds, zero_division=0)
+    f1 = f1_score(y_train, preds, zero_division=0)
+    
+    results.append({
+        "Soglia": t,
+        "Precision (OOF)": precision,
+        "Recall (OOF)": recall,
+        "F1-Score (OOF)": f1
+    })
+
+results_df = pl.DataFrame(results)
+```
+
+
+```{python}
+#| label: treshold_optimization_table_exibithion
+#| echo: false
+
+(
+    GT(results_df)
+    .tab_header(title="Threshold optimization (Out-Of-Fold on Training Set)")
+)
+
+```
+
+
+```{python}
+#| label: select_best_threshold
+#| include: false
+
+
+best_row = (
+    results_df
+        .sort(
+            "F1-Score (OOF)",
+            descending=True
+        )
+        .row(0, named=True)
+)
+
+best_threshold = best_row["Soglia"]
+
+
+print(f"Soglia ottimale congelata (scelta via OOF): {best_threshold}")
+
+```
+
+Optimal threhold is 0.9.
+
+
+## Last fit and test set evaluation
+
+### Fit and metrics on test set
+
+```{python}
+#| label: final_test_evaluation
+#| echo: false
+
+from sklearn.metrics import average_precision_score, roc_auc_score, confusion_matrix
+
+# 1. Final fit of the best workflow found from training set
+best_workflow.fit(X_train, y_train)
+
+# 2. Inference on test set
+y_prob_test = best_workflow.predict_proba(X_test)[:, 1]
+
+# 3. Metrics calculation
+test_pr_auc = average_precision_score(y_test, y_prob_test)
+test_roc_auc = roc_auc_score(y_test, y_prob_test)
+
+print(f"=== FINAL PERFORMANCE ON TEST SET ({best_workflow_name}) ===")
+print(f"Test PR-AUC (Metrica Primaria): {test_pr_auc:.4f}")
+print(f"Test ROC-AUC: {test_roc_auc:.4f}")
+
+# 4. Application of the threshold defined with OOF
+y_pred_test_final = (y_prob_test >= best_threshold).astype(int)
+cm = confusion_matrix(y_test, y_pred_test_final)
+
+#print(f"\nMatrice di Confusione sul Test Set (Soglia {best_threshold}):")
+#print(cm)
+
+```
+
+
+### Confusion matrix
+
+```{python}
+#| label: confusion-matrix
+#| echo: false
+
+# Skip hard coding by using the threshold determined via OOF (best_threshold)
+y_pred_finale = (y_prob_test >= best_threshold).astype(int)
+cm = confusion_matrix(y_test, y_pred_finale)
+
+print(f"Confusion Matrix (Soglia {best_threshold}):")
+print(cm)
+cm_df = pl.DataFrame(cm)
+```
+
+## Final thougths: take aways and next steps
+
+### Explainability
+
+Finally, it's important to be able to explain what happens "under to hood". Since tree-based model are pretty informative from this point of view, a quite aknowledged tool for ML explainability is SHAP.
+
+```{python}
+#| label: explanation_SHAP for best workflow set
+#| echo: false
+
+
+# 1. Extract the "plain and simple" chosen model from the workflow_set object, isolating it from preprocessing recipes.
+model_definitive = best_workflow.named_steps["classifier"]
+
+# 2. Create a preprocessing-only pipeline (feature engineering + preprocessing) slicing the classifier step (model). It's necessary to transform data the same way the ML workflow doese before SHAP makes its evaluations related to the model.
+transformer_steps = Pipeline(best_workflow.steps[:-1])
+
+# 3. Apply overall preprocessing steps to test set (output is a preprocessd NumPy array)
+X_test_preprocessed = transformer_steps.transform(X_test)
+
+# 4. Extract base feature names immediately after the feature engineering  (pre-EDA only). Since full preprocessing converts data into a NumPy array (losing column names), we capture the base names here; any structural column changes or expansions caused by subsequent preprocessing steps (post-EDA) will be dynamically handled and mapped in Step 5.
+# Note that .transform() is used since fe_transformer is a FunctionTransformer from scikit-learn.
+
+fe_transformer = best_workflow.named_steps["feature_engineering"]
+
+df_after_fe = fe_transformer.transform(X_test)
+
+if hasattr(df_after_fe, "columns"):
+    base_feature_names = df_after_fe.columns
+else:
+    base_feature_names = df_after_fe.to_pandas().columns
+
+# Logical path of the if-else above:
+# if df_after_fe hasattr (has attribute) columns
+# then base_feature_names take columns names
+# else df_after_fe is converted into a Pandas dataframe and then columns name
+# are taken
+
+
+# 5.  Extract features' final name and rebuild Pandas dataframe for SHAP analysis
+
+# Use the names from feature engineering preprocessing
+feature_names = base_feature_names
+
+# Isolate post EDA preprocessing recipe
+last_preprocessing_step = transformer_steps[-1]
+
+# Check if post-EDA preprocessing has the method to give back columns names changed after the recipe use (i.e. One Hot Encoding).
+if hasattr(last_preprocessing_step, "get_feature_names_out"):
+    feature_names = last_preprocessing_step.get_feature_names_out(base_feature_names)
+else:
+    feature_names = base_feature_names
+
+# Logical path of the if-else above:
+# if the last preprocessing step has the method "get_feature_names_out"
+# then feature_names take the dynamically expanded names based on base_feature_names
+# else feature_names remain equal to base_feature_names (no structural changes occurred)
+
+# Build final Pandas DataFrame for SHAP joining NumpY array to proper current column names
+X_test_pd = pd.DataFrame(X_test_preprocessed, columns=feature_names)
+
+
+# 6. SHAP execution
+
+# Initializing SHAP explainer (dedicated to tree models) with the pure model. This is the engine that will run calculations.
+explainer = shap.TreeExplainer(model_definitive)
+
+# Compute SHAP values using explainer object on the actual dataset (X_test_pd)
+shap_values = explainer.shap_values(X_test_pd)
+
+
+# 7. SHAP auto-plot
+shap.summary_plot(
+    shap_values,
+    X_test_pd,
+    plot_type="bar"
+    )
+
+```
+
+The top 5 feature the act as key influencer in model forecast are: transaction amount, transaction hour, transaction day, city population and category_food_dining. Note that summing the SHAP values of each one-hot group per original feature merchant category gets a pretty higher relevance as a stand-alone feature.
+
+Amount was clearly detected during EDA as a very significant predictor, as well as weekday and hour. City population's importance was sligthly underestimated during EDA, aknowledging that frauds seemed less frequent in the biggest cities.
+
+It's a little counterintuitive to see that merchant categories are not so important. This is a feature that has been encoded, so divided into many separate categories. Has this some effect?
+
+
+
+### Lessons learned
+
+1. Preprocessing follows a three steps path.
+
+1.1. There is a pre-split (and pre-EDA as well) preprocessing which is the feature engineering based on domain knowledge. It leverages the data scientist's domain competencies to simplify dataset structure, to create new features or to change data types if necessary. It works on raw data, provides the basis for executing EDA. Since this changes are not based on target feature, it can be executed on the whole raw data without any leakage risk. Data split can be done later in the pipeline.
+
+1.2. There is a pre-EDA and post-split preprocessing that sometimes could be useful. It's a non-mandatory, contingent step aimed to enrich the train set only. 
+This approach is necessary when a new feature is created based on target value (like job aggregate in this specific project): it's useful during EDA but cannot be extended to the whole dataset because the use of target value would introduce leakage. Applying these manipulations to train set only and use them in EDA step create a sort of "sandbox" that keeps the whole process safe (see point 4). 
+
+1.3. Once EDA returns its outcome, these insights lead to a new round of manipulation (post-EDA and post-split) which works on the dataset used by EDA: it could be a feature that turns out to be useless (or correlated to others) and so to be dropped or it could be a transformation useful to properly feed the model (encoding, scaling and so on).  
+
+So, we see two or three "layers" of manipulation (the second manipulation may be not necessary) that must be executed in the the proper sequence starting from raw data only to grant that the overall process is deployable. 
+
+2. One hot encoding may dilute the power of a single high cardinality feature (i.e. merchant category, job) that was splitted into a quite high number of columns. This may bring the risk of weakening the final message of explainability techniques.
+
+3. Even tough pointblank has been used to validate data, pandera is the standard to adopt.
+
+4. Target encoding must be handled carefully. Using y to change X is not a good pratice outside EDA as modeling could be jeopardize.
+
+5. Since we're dealing with a massively unbalanced target distribution, threshold cannot be set as a standard 0.5. It must be optimized. In the modeling pipeline, this passage must be placed before the final fit and the performance evalution and must be executed on training set. This activity is composed of the following steps:
+
+- generation of Out-Of-Fold predictions using cross_val_predict on the training set,
+
+- calculation of the threshold table (0.1 - 0.9),
+
+- identification of the optimal cut-off to maximize the core metric.
+
+

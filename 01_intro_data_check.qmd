@@ -1,0 +1,302 @@
+---
+title: "DATA PREPARATION"
+jupyter: python3
+---
+
+## Preliminary settings 
+
+### Library loading
+
+
+```{python}
+#| label: setup
+#| include: false
+
+# SETUP & CONFIGURATION
+
+import sys
+from pathlib import Path
+
+# If we are in 'notebooks', we need to go up one level to find 'scripts'
+current_path = Path.cwd()
+if current_path.name == "notebooks":
+    scripts_path = current_path.parent / "scripts"
+else:
+    scripts_path = current_path / "scripts"
+
+
+# Add the scripts directory to the Python path
+# This allows Python to find your custom .py files inside the /scripts folder
+sys.path.append(str(scripts_path))
+
+# Import your configuration script
+# This executes the os.chdir and pl.Config settings defined in project_config.py
+import project_config
+paths = project_config.paths
+```
+
+```{python}
+#| label: library-loading
+#| include: false
+
+# os, Path have already been loaded in the setup script
+
+# Data loading
+from data_ingestion import dataset_import # customized scipt
+
+# Data manipulation
+import polars as pl
+import polars.selectors as cs
+import pandas as pd # Required for ydata_profiling conversion
+from data_wrangling_v2 import feature_engineering # customized script
+
+# Analysis tools
+from ydata_profiling import ProfileReport # Import of report tool only
+from skimpy import skim
+from data_describe import data_describe # customized script
+from data_profiling import create_quality_report # customized script
+
+# Data viz
+from great_tables import GT
+from IPython.display import display
+
+# Data validation
+# import pandera.polars as pa
+
+# Data partitioning
+from sklearn.model_selection import train_test_split
+
+# File saving
+from intermediate_files_v2 import (
+    save_train_test_eda_datasets,
+    save_train_test_modeling_datasets
+)
+```
+
+## Data ingestion and quality control
+
+This very first step of the project is aimed to import data, check them and to, prior to a proper EDA, that kind of data wrangling which necessarily are to be executed on the whole dataset (na handling, renaming, feature engineergin).
+These are not strictly EDA's steps and take place at this very early stage in order to have a well defined dataset to be splitted (last step of this preparation phase), since every EDA activity and insight is supposed to be leveraged on the train test only to avoid any kind of data leakage.
+
+```{python}
+#| label: data-ingestion
+#| include: false
+
+
+# I feed the function with the dataset proper path
+data_origin = dataset_import(paths["dataset_path"])
+
+```
+
+### Dataset check
+
+The shape of the dataset is the following.
+```{python}
+#| label: data-origin-shape
+#| echo: false
+
+print(f"Rows: {data_origin.shape[0]}")
+print(f"Columns: {data_origin.shape[1]}")
+
+```
+
+```{python}
+#| label: data-origin-schema
+#| echo: false
+
+# create a schema in Polars DataFrame data type
+data_schema = pl.DataFrame({
+    "feature": data_origin.schema.names(),
+    "dtype": [str(d) for d in data_origin.schema.dtypes()]
+})
+
+# Visualize schema with GT
+(
+    GT(data_schema)
+    .tab_header(
+        title="Dataset schema",
+        subtitle="Feature names and data types"
+        )
+    )
+
+```
+
+Initial observations:
+
+- **sn** (serial number): Row ID starting from 0. Values will be shifted to start from 1 for clarity.
+- **trans_date_trans_time**: Transaction timestamp stored as string. Requires conversion to datetime and splitting into separate date and time columns.
+- **merchant, gender**: Values prefixed with "fraud_" - this notation will be trimmed.
+- **category**: Categorical feature stored as string. Will be cast to Categorical type for better performance.
+- **zip**: Stored as number but should be treated as text (no calculations needed).
+- **dob**: Date of birth stored as string. Will be converted to date type.
+- **cc_num, first, last, lat, long, trans_num, merch_lat, merch_long**: Not useful for analysis and will be dropped.
+- **is_fraud**: Target variable with binary values (0/1). Will be converted to boolean type.
+
+```{python}
+#| label: data-describe
+#| echo: false
+
+
+data_describe(data_origin)
+
+```
+
+
+There are no null values.
+
+
+### Data profiling
+
+```{python}
+#| label: data-profiling
+#| include: false
+
+create_quality_report(
+    data_origin,
+    paths["report_dir"] / "data_quality.html"
+    )
+```
+
+The yData Report confirms there are neither null values nor duplicated columns.
+Most correlations are amongst geographical features (lat, long, zip, state, mech_lat and so on) and this does not seem to have a major impact on the dataset preparation.
+amt (amount) is a numerical value whose minimun value is 1 which is consistent with its content. 
+
+### Data wrangling
+
+In order to focus on feature that show a business relevance and a manageble cardinality, the following manipulation have been executed:
+1. id_transition starts from 1 to improve readability,
+2. trans_date_trans_time is switched to datetime data type and then splitted into date and time columns.
+3. day, month, weekday and hour have been created from date feature as category data type.
+4. age and amount have been binned and turned into category.
+5. a series of column have been deselected ("sn", "trans_date_trans_time", "cc_num", "first", "last", "lat", "long", "trans_num", "merch_lat", "merch_long", "zip", "dob" "unix_time") since either used to get more informative or simpler feature or assessed as poorly informative.
+6. amt has been renamed into "amount" to improve readability.
+
+```{python}
+#| label: data-wrangling
+#| echo: false
+
+
+
+data = feature_engineering(data_origin)
+```
+
+### Data glimpse
+
+```{python}
+#| label: data-schema-after-data-wrangling
+#| echo: false
+
+# create a schema in Polars DataFrame data type
+data_schema_post_wrangling = pl.DataFrame({
+    "feature": data.schema.names(),
+    "dtype": [str(datatype) for datatype in data.schema.dtypes()]
+})
+
+# Visualize schema with GT
+(
+    GT(data_schema_post_wrangling)
+    .tab_header(
+        title="Post wranging dataset schema",
+        subtitle="Feature names and data types"
+        )
+    )
+```
+
+## Data validation
+
+I'm going to use Pointblank library to set up validation business rules that allow me to verify whether data are good from a business point of view.
+Actually only three business rules have been tested:
+1) amount greater than 0.
+2) is_fraud (target feature) not null.
+3) city_pop greater than 0.
+As brief and sintetic result, simply all the three rules have been respected. 
+
+```{python}
+#| label: data-validation
+#| echo: false
+#| output: true
+
+from data_validation import validate_data
+from tabulate import tabulate
+from IPython.display import Markdown
+
+# Run validation
+validation_agent = validate_data(data)
+
+print(f"All checks passed: {validation_agent.all_passed()}")
+print(f"Total steps: {len(validation_agent.validation_info)}")
+```
+
+## Data partitioning
+
+### Data splitting
+
+```{python}
+#| label: data-splitting
+#| include: false
+
+from data_partitioning import data_splitting
+
+# 1. Post-feature engineering data split (to be used by EDA)
+(
+    data_train_eda,
+    data_test_eda,
+    prop_target_data_eda,
+    prop_target_data_train_eda,
+    prop_target_data_test_eda
+    ) = data_splitting(data)
+
+# 2. Raw/original data split (to be used by Modeling End-to-End)
+# Note that I keep placeholder "_" which means "feature I won't use since I'm not interested in". They must be included because data_splitting command provides with 5 variable anyway.
+(
+    data_train_origin,
+    data_test_origin,
+    _,
+    _,
+    _
+    ) = data_splitting(data_origin)
+
+```
+
+### Target feature proportion check
+
+```{python}
+#| label: stratification-check
+#| echo: false
+
+# Note the usage of display() to force Quarto to render each table.
+display(GT(prop_target_data_eda).tab_header(title="Full dataset"))
+display(GT(prop_target_data_train_eda).tab_header(title="Training Set"))
+display(GT(prop_target_data_test_eda).tab_header(title="Test Set"))
+
+```
+
+```{python}
+#| label: output-files
+#| include: false
+
+# Save train and test Polars datasets
+# The principles that guides End-To_End modeling in a production-oriented architecture (deployment) are:
+# 1) the file that feed modeling must contain raw data, meaning that both structure and content are the same that come from informative system. No manipulation must feed modeling.
+# 2) Feature engineering must be executed before EDA in order to pass EDA a properly enriched/manipulated dataset, but it also must be part and parcel of the first step of the scikit-learn pipeling during modeling step.
+
+
+
+
+
+# 1. Output for chapter 2 (EDA)
+save_train_test_eda_datasets(
+    df_train_polars = data_train_eda,
+    df_test_polars = data_test_eda,
+    output_dir = paths["processed_data_dir"]
+    )
+
+# 2. Output for chapter 3 (modeling)
+save_train_test_modeling_datasets(
+    df_train_polars = data_train_origin,
+    df_test_polars = data_test_origin,
+    output_dir = paths["processed_data_dir"]
+)
+
+```
+
